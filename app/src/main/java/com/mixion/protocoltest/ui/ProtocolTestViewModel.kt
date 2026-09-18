@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import com.mixion.protocoltest.core.protocol.ProtocolValidator
+import com.mixion.protocoltest.core.protocol.ValidationReport
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -37,6 +39,7 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
     val activeTest: StateFlow<ActiveTestState> = engine.activeTest
     val testHistory: StateFlow<List<TestHistoryItem>> = engine.testHistory
     val trafficLogs: StateFlow<List<TrafficLogEntry>> = engine.trafficLogs
+    val discoveredCapabilities: StateFlow<com.mixion.protocoltest.core.protocol.DiscoveredCapabilities?> = engine.discoveredCapabilities
 
     // USB Device Management
     private val _discoveredDevices = MutableStateFlow<List<DiscoveredUsbDevice>>(emptyList())
@@ -51,6 +54,9 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
     // Command & Request Builder State
     private val _selectedCommand = MutableStateFlow(ProtocolCommand.HELLO)
     val selectedCommand: StateFlow<ProtocolCommand> = _selectedCommand.asStateFlow()
+
+    private val _currentGeneratedRequestId = MutableStateFlow(ProtocolRegistry.nextRequestId("HS"))
+    val currentGeneratedRequestId: StateFlow<String> = _currentGeneratedRequestId.asStateFlow()
 
     private val _customRequestId = MutableStateFlow("")
     val customRequestId: StateFlow<String> = _customRequestId.asStateFlow()
@@ -144,6 +150,22 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
 
     fun setSelectedCommand(command: ProtocolCommand) {
         _selectedCommand.value = command
+        refreshGeneratedRequestId(command)
+    }
+
+    private fun refreshGeneratedRequestId(command: ProtocolCommand = _selectedCommand.value) {
+        val prefix = when (command) {
+            ProtocolCommand.HELLO -> "HS"
+            ProtocolCommand.CAPABILITIES -> "CAP"
+            ProtocolCommand.STATUS -> "REQ-STATUS"
+            ProtocolCommand.GLASS_STATUS -> "REQ-GLASS"
+            ProtocolCommand.DISPENSE -> "REQ"
+            ProtocolCommand.STOP -> "REQ-STOP"
+            ProtocolCommand.RESET -> "REQ-RESET"
+            ProtocolCommand.HEARTBEAT -> "HB"
+            ProtocolCommand.CUSTOM -> "TEST"
+        }
+        _currentGeneratedRequestId.value = ProtocolRegistry.nextRequestId(prefix)
     }
 
     fun setCustomRequestId(id: String) {
@@ -239,7 +261,7 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
      */
     fun getRequestPreview(): RequestPreviewData {
         val cmd = _selectedCommand.value
-        val reqId = _customRequestId.value.ifBlank { ProtocolRegistry.nextRequestId() }
+        val reqId = _customRequestId.value.ifBlank { _currentGeneratedRequestId.value }
         val payload = buildCurrentPayload()
         val customName = if (cmd == ProtocolCommand.CUSTOM) _customCommandName.value else null
 
@@ -254,6 +276,11 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
         val canonicalWithoutCrc = CanonicalJson.canonicalize(reqObj, excludeCrc = true)
         val crc = reqObj.optString("crc32")
         val rawHex = HexUtil.toHexString(signedFrame)
+        val validation = ProtocolValidator.validateRequest(
+            signedFrame,
+            cmd,
+            capabilities = engine.discoveredCapabilities.value
+        )
 
         return RequestPreviewData(
             requestId = reqId,
@@ -261,7 +288,8 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
             canonicalWithoutCrc = canonicalWithoutCrc,
             crc32 = crc,
             finalNdjsonFrame = signedFrame,
-            rawTxHex = rawHex
+            rawTxHex = rawHex,
+            validationReport = validation
         )
     }
 
@@ -280,6 +308,13 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
                 customRequestId = preview.requestId,
                 customCommandName = if (cmd == ProtocolCommand.CUSTOM) _customCommandName.value else null
             )
+            refreshGeneratedRequestId(cmd)
+        }
+    }
+
+    fun retryLastRequest() {
+        viewModelScope.launch {
+            engine.retryLastTest()
         }
     }
 
@@ -292,6 +327,7 @@ class ProtocolTestViewModel(application: Application) : AndroidViewModel(applica
                 customPayload = buildCurrentPayload(),
                 customRequestId = preview.requestId
             )
+            refreshGeneratedRequestId(ProtocolCommand.DISPENSE)
         }
     }
 
@@ -307,5 +343,6 @@ data class RequestPreviewData(
     val canonicalWithoutCrc: String,
     val crc32: String,
     val finalNdjsonFrame: String,
-    val rawTxHex: String
+    val rawTxHex: String,
+    val validationReport: ValidationReport
 )

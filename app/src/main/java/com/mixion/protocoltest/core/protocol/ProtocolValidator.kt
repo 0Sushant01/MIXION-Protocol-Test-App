@@ -12,10 +12,251 @@ data class ValidationReport(
     val isPass: Boolean,
     val checks: List<ValidationCheckItem>,
     val failureReasons: List<String>,
-    val parsedMessage: ProtocolMessage? = null
+    val parsedMessage: ProtocolMessage? = null,
+    val crcResult: CrcVerificationResult? = null
 )
 
 object ProtocolValidator {
+
+    /**
+     * Validates a generated or transmitted MIXION V1.0 request frame against the wire specification.
+     */
+    fun validateRequest(
+        rawFrame: String,
+        expectedCommand: ProtocolCommand? = null,
+        capabilities: DiscoveredCapabilities? = null
+    ): ValidationReport {
+        val checks = mutableListOf<ValidationCheckItem>()
+        val failureReasons = mutableListOf<String>()
+
+        // Check 1: NDJSON Framing
+        val hasTrailingLf = rawFrame.endsWith("\n")
+        checks.add(
+            ValidationCheckItem(
+                name = "NDJSON Frame Framing",
+                isPassed = hasTrailingLf,
+                details = if (hasTrailingLf) "Terminated by newline (LF \\n)" else "Missing trailing LF framing delimiter"
+            )
+        )
+        if (!hasTrailingLf) {
+            failureReasons.add("Frame is not properly terminated with LF (\\n).")
+        }
+
+        // Check 2: JSON Parsing
+        val clean = rawFrame.trim()
+        val json = try {
+            JSONObject(clean)
+        } catch (e: Exception) {
+            checks.add(
+                ValidationCheckItem(
+                    name = "JSON Parsing",
+                    isPassed = false,
+                    details = "Syntax error: ${e.message}"
+                )
+            )
+            failureReasons.add("Malformed JSON: ${e.message}")
+            return ValidationReport(
+                isPass = false,
+                checks = checks,
+                failureReasons = failureReasons
+            )
+        }
+        checks.add(
+            ValidationCheckItem(
+                name = "JSON Parsing",
+                isPassed = true,
+                details = "Valid JSON object structure"
+            )
+        )
+
+        // Check 3: CRC32 Integrity
+        val crcCheck = CanonicalJson.verifyCrc(clean)
+        checks.add(
+            ValidationCheckItem(
+                name = "CRC-32/ISO-HDLC Integrity",
+                isPassed = crcCheck.isValid,
+                details = if (crcCheck.isValid) {
+                    "Valid CRC32: ${crcCheck.receivedCrc} (matches canonical hash)"
+                } else {
+                    crcCheck.errorMessage ?: "CRC verification failed"
+                }
+            )
+        )
+        if (!crcCheck.isValid) {
+            failureReasons.add(crcCheck.errorMessage ?: "CRC verification failed.")
+        }
+
+        // Check 4: Protocol Version
+        val rawVersion = json.opt("version")
+        val isVersionValid = (rawVersion is Int || rawVersion is Long) && (rawVersion as Number).toInt() == 1
+        val version = if (rawVersion is Number) (rawVersion as Number).toInt() else -1
+        checks.add(
+            ValidationCheckItem(
+                name = "Protocol Version",
+                isPassed = isVersionValid,
+                details = if (isVersionValid) "version: 1 (MIXION V1.0)" else "Invalid version: $rawVersion (expected integer 1)"
+            )
+        )
+        if (!isVersionValid) {
+            failureReasons.add("Protocol version mismatch: got $rawVersion, expected integer 1.")
+        }
+
+        // Check 5: Message Type
+        val type = json.optString("type", "")
+        val isTypeValid = type == "request"
+        checks.add(
+            ValidationCheckItem(
+                name = "Message Type",
+                isPassed = isTypeValid,
+                details = if (isTypeValid) "type: 'request'" else "Invalid type: '$type' (expected 'request')"
+            )
+        )
+        if (!isTypeValid) {
+            failureReasons.add("Invalid message type: got '$type', expected 'request'.")
+        }
+
+        // Check 6: Request ID
+        val requestId = json.optString("request_id", "")
+        val isReqIdValid = requestId.isNotBlank()
+        checks.add(
+            ValidationCheckItem(
+                name = "Request ID Present",
+                isPassed = isReqIdValid,
+                details = if (isReqIdValid) "request_id: '$requestId'" else "Missing or blank request_id"
+            )
+        )
+        if (!isReqIdValid) {
+            failureReasons.add("Missing or blank request_id.")
+        }
+
+        // Check 7: Command Match
+        val command = json.optString("command", "")
+        val isCommandValid = if (expectedCommand != null && expectedCommand != ProtocolCommand.CUSTOM) {
+            command.equals(expectedCommand.commandName, ignoreCase = true)
+        } else {
+            command.isNotBlank()
+        }
+        checks.add(
+            ValidationCheckItem(
+                name = "Command Specification",
+                isPassed = isCommandValid,
+                details = if (isCommandValid) "command: '$command'" else "Command mismatch: '$command' (expected ${expectedCommand?.commandName})"
+            )
+        )
+        if (!isCommandValid) {
+            failureReasons.add("Invalid or unexpected command: '$command'.")
+        }
+
+        // Check 8: Payload Schema Validation
+        val payload = json.optJSONObject("payload")
+        var schemaError: String? = null
+
+        if (payload == null) {
+            schemaError = "Missing 'payload' object in request"
+        } else {
+            when (command.uppercase()) {
+                "HELLO" -> {
+                    val device = payload.optString("device", "")
+                    val rawProtoVer = payload.opt("protocol_version")
+                    if (device.isBlank()) schemaError = "HELLO request missing payload.device"
+                    if (rawProtoVer !is Int && rawProtoVer !is Long) {
+                        schemaError = "HELLO request protocol_version must be integer 1 (got $rawProtoVer)"
+                    } else if ((rawProtoVer as Number).toInt() != 1) {
+                        schemaError = "HELLO request protocol_version must be 1 (got $rawProtoVer)"
+                    }
+                }
+                "DISPENSE" -> {
+                    val orderId = payload.optString("order_id", "")
+                    val pumps = payload.optJSONArray("pumps")
+                    if (orderId.isBlank()) {
+                        schemaError = "DISPENSE request missing non-empty payload.order_id"
+                    } else if (pumps == null || pumps.length() == 0) {
+                        schemaError = "DISPENSE request payload.pumps array must be non-empty"
+                    } else {
+                        val seenPumps = mutableSetOf<Int>()
+                        for (i in 0 until pumps.length()) {
+                            val pump = pumps.optJSONObject(i)
+                            if (pump == null) {
+                                schemaError = "DISPENSE pump item #$i is not an object"
+                                break
+                            }
+
+                            // Strict Integer Validation: Protocol V1.0 requires positive integers.
+                            // Floating point representations (e.g. 1500.5 or 1.0) are strictly forbidden.
+                            val rawPid = pump.opt("pump_id")
+                            if (rawPid !is Int && rawPid !is Long) {
+                                schemaError = "DISPENSE pump_id must be a positive integer; floating-point or non-integer values are strictly forbidden (got $rawPid)"
+                                break
+                            }
+                            val rawDur = pump.opt("duration_ms")
+                            if (rawDur !is Int && rawDur !is Long) {
+                                schemaError = "DISPENSE duration_ms must be a positive integer; floating-point or non-integer values are strictly forbidden (got $rawDur)"
+                                break
+                            }
+
+                            val pid = (rawPid as Number).toInt()
+                            val dur = (rawDur as Number).toLong()
+
+                            if (pid <= 0) {
+                                schemaError = "DISPENSE pump_id must be a positive integer (got $pid)"
+                                break
+                            }
+                            if (dur <= 0) {
+                                schemaError = "DISPENSE duration_ms must be a positive integer in milliseconds (got $dur)"
+                                break
+                            }
+                            if (seenPumps.contains(pid)) {
+                                schemaError = "Duplicate pump_id $pid in DISPENSE request (violates Section 31)"
+                                break
+                            }
+                            seenPumps.add(pid)
+
+                            // Capability Gating: Validate against discovered capabilities if available
+                            if (capabilities != null && !capabilities.supportedPumpIds.contains(pid)) {
+                                schemaError = "Pump ID $pid is not supported by Embedded capabilities (supported: ${capabilities.supportedPumpIds.sorted()})"
+                                break
+                            }
+                        }
+                    }
+                }
+                else -> {
+                    // Other V1 commands require a payload object (can be empty)
+                }
+            }
+        }
+
+        val isSchemaValid = schemaError == null
+        checks.add(
+            ValidationCheckItem(
+                name = "Request Payload Schema",
+                isPassed = isSchemaValid,
+                details = schemaError ?: "Request payload conforms to MIXION V1.0 specification"
+            )
+        )
+        if (!isSchemaValid) {
+            failureReasons.add(schemaError!!)
+        }
+
+        val parsedMsg = ProtocolMessage(
+            version = version,
+            type = type,
+            requestId = requestId,
+            command = command,
+            status = null,
+            payload = payload ?: JSONObject(),
+            error = null,
+            crc32 = crcCheck.receivedCrc,
+            rawJson = clean
+        )
+
+        return ValidationReport(
+            isPass = failureReasons.isEmpty(),
+            checks = checks,
+            failureReasons = failureReasons,
+            parsedMessage = parsedMsg,
+            crcResult = crcCheck
+        )
+    }
 
     fun validateResponse(
         rawFrame: String,
@@ -72,7 +313,7 @@ object ProtocolValidator {
                 name = "CRC-32/ISO-HDLC Integrity",
                 isPassed = crcCheck.isValid,
                 details = if (crcCheck.isValid) {
-                    "Valid CRC32: ${crcCheck.receivedCrc} (matches calculated)"
+                    "Valid CRC32: ${crcCheck.receivedCrc} (matches canonical checksum)"
                 } else {
                     crcCheck.errorMessage ?: "CRC verification failed"
                 }
@@ -83,17 +324,18 @@ object ProtocolValidator {
         }
 
         // Check 4: Protocol Version
-        val version = json.optInt("version", -1)
-        val isVersionValid = version == 1
+        val rawVersion = json.opt("version")
+        val isVersionValid = (rawVersion is Int || rawVersion is Long) && (rawVersion as Number).toInt() == 1
+        val version = if (rawVersion is Number) (rawVersion as Number).toInt() else -1
         checks.add(
             ValidationCheckItem(
                 name = "Protocol Version",
                 isPassed = isVersionValid,
-                details = if (isVersionValid) "version: 1 (MIXION V1.0)" else "Invalid version: $version (expected 1)"
+                details = if (isVersionValid) "version: 1 (MIXION V1.0)" else "Invalid version: $rawVersion (expected integer 1)"
             )
         )
         if (!isVersionValid) {
-            failureReasons.add("Protocol version mismatch: received $version, expected 1.")
+            failureReasons.add("Protocol version mismatch: received $rawVersion, expected integer 1.")
         }
 
         // Check 5: Message Type
@@ -181,19 +423,40 @@ object ProtocolValidator {
                 ProtocolCommand.HELLO -> {
                     if (status == ProtocolStatus.ACCEPTED) {
                         val device = payload.optString("device", "")
-                        val protoVer = payload.optInt("protocol_version", -1)
+                        val rawProtoVer = payload.opt("protocol_version")
                         if (device.isBlank()) schemaError = "HELLO response missing payload.device"
-                        if (protoVer != 1) schemaError = "HELLO response protocol_version != 1 (got $protoVer)"
+                        if (rawProtoVer !is Int && rawProtoVer !is Long) {
+                            schemaError = "HELLO response protocol_version must be integer 1 (got $rawProtoVer)"
+                        } else if ((rawProtoVer as Number).toInt() != 1) {
+                            schemaError = "HELLO response protocol_version != 1 (got $rawProtoVer)"
+                        }
                     }
                 }
                 ProtocolCommand.CAPABILITIES -> {
                     if (status == ProtocolStatus.OK) {
-                        val pumpCount = payload.optInt("pump_count", -1)
-                        val supportedPumps = payload.optJSONArray("supported_pump_ids")
-                        val commands = payload.optJSONArray("commands")
-                        if (pumpCount <= 0) schemaError = "CAPABILITIES missing or invalid pump_count"
-                        if (supportedPumps == null || supportedPumps.length() == 0) schemaError = "CAPABILITIES missing supported_pump_ids array"
-                        if (commands == null || commands.length() == 0) schemaError = "CAPABILITIES missing commands array"
+                        val rawPumpCount = payload.opt("pump_count")
+                        if (rawPumpCount !is Int && rawPumpCount !is Long) {
+                            schemaError = "CAPABILITIES missing or invalid pump_count (must be positive integer, got $rawPumpCount)"
+                        } else {
+                            val pumpCount = (rawPumpCount as Number).toInt()
+                            val supportedPumps = payload.optJSONArray("supported_pump_ids")
+                            val commands = payload.optJSONArray("commands")
+                            if (pumpCount <= 0) {
+                                schemaError = "CAPABILITIES pump_count must be a positive integer (got $pumpCount)"
+                            } else if (supportedPumps == null || supportedPumps.length() == 0) {
+                                schemaError = "CAPABILITIES missing supported_pump_ids array"
+                            } else if (commands == null || commands.length() == 0) {
+                                schemaError = "CAPABILITIES missing commands array"
+                            } else {
+                                for (i in 0 until supportedPumps.length()) {
+                                    val rawId = supportedPumps.opt(i)
+                                    if (rawId !is Int && rawId !is Long) {
+                                        schemaError = "CAPABILITIES supported_pump_ids item #$i must be an integer (got $rawId)"
+                                        break
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 ProtocolCommand.STATUS -> {
@@ -212,7 +475,9 @@ object ProtocolValidator {
                     }
                 }
                 ProtocolCommand.DISPENSE -> {
-                    if (status == ProtocolStatus.COMPLETED) {
+                    if (status == ProtocolStatus.ACCEPTED) {
+                        // Section 17: ACCEPTED response carries empty payload object
+                    } else if (status == ProtocolStatus.COMPLETED) {
                         val result = payload.optString("result", "")
                         if (result != "SUCCESS") {
                             schemaError = "DISPENSE COMPLETED payload result is '$result' (expected 'SUCCESS')"
@@ -272,7 +537,8 @@ object ProtocolValidator {
             isPass = failureReasons.isEmpty(),
             checks = checks,
             failureReasons = failureReasons,
-            parsedMessage = parsedMsg
+            parsedMessage = parsedMsg,
+            crcResult = crcCheck
         )
     }
 }

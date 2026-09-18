@@ -172,7 +172,11 @@ object CanonicalJson {
     }
 
     /**
-     * Verifies the CRC on a received frame or JSON string.
+     * Verifies the CRC on a received frame or JSON string according to MIXION Protocol V1.0 Section 8 & Section 31:
+     * - Checks crc32 presence and exact ^[0-9A-F]{8}$ uppercase hex format
+     * - Generates canonical JSON without crc32
+     * - Calculates CRC-32/ISO-HDLC over canonical UTF-8 bytes
+     * - Compares received vs calculated checksum
      */
     fun verifyCrc(jsonString: String): CrcVerificationResult {
         val clean = jsonString.trim().removeSuffix("\n").removeSuffix("\r")
@@ -184,6 +188,7 @@ object CanonicalJson {
                 receivedCrc = null,
                 calculatedCrc = null,
                 canonicalJson = null,
+                rawFrame = clean,
                 errorMessage = "Invalid JSON: ${e.message}"
             )
         }
@@ -194,21 +199,36 @@ object CanonicalJson {
                 receivedCrc = null,
                 calculatedCrc = null,
                 canonicalJson = null,
+                rawFrame = clean,
                 errorMessage = "Missing 'crc32' field"
             )
         }
 
-        val receivedCrc = json.getString("crc32").uppercase()
+        val rawCrc = json.optString("crc32", "")
         val canonicalWithoutCrc = canonicalize(json, excludeCrc = true)
         val calculatedCrc = Crc32Util.calculate(canonicalWithoutCrc)
-        val matches = calculatedCrc.equals(receivedCrc, ignoreCase = true)
+
+        // Validate pattern ^[0-9A-F]{8}$ (Section 31)
+        if (!rawCrc.matches(Regex("^[0-9A-F]{8}$"))) {
+            return CrcVerificationResult(
+                isValid = false,
+                receivedCrc = rawCrc,
+                calculatedCrc = calculatedCrc,
+                canonicalJson = canonicalWithoutCrc,
+                rawFrame = clean,
+                errorMessage = "Malformed 'crc32' format: '$rawCrc' (must be exactly 8 uppercase hex characters ^[0-9A-F]{8}$)"
+            )
+        }
+
+        val matches = calculatedCrc == rawCrc
 
         return CrcVerificationResult(
             isValid = matches,
-            receivedCrc = receivedCrc,
+            receivedCrc = rawCrc,
             calculatedCrc = calculatedCrc,
             canonicalJson = canonicalWithoutCrc,
-            errorMessage = if (matches) null else "CRC mismatch: expected $calculatedCrc, received $receivedCrc"
+            rawFrame = clean,
+            errorMessage = if (matches) null else "CRC mismatch: expected $calculatedCrc, received $rawCrc"
         )
     }
 }
@@ -218,5 +238,6 @@ data class CrcVerificationResult(
     val receivedCrc: String?,
     val calculatedCrc: String?,
     val canonicalJson: String?,
+    val rawFrame: String? = null,
     val errorMessage: String?
 )

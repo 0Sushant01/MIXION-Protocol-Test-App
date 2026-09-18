@@ -52,7 +52,21 @@ data class ActiveTestState(
     val rawRxHex: String = "",
     val latencyMs: Long = 0,
     val validationReport: ValidationReport? = null,
-    val errorMessage: String? = null
+    val requestValidationReport: ValidationReport? = null,
+    val dispensePhase1RxFrame: String? = null,
+    val dispensePhase2RxFrame: String? = null,
+    val errorMessage: String? = null,
+    val isRetriable: Boolean = false,
+    val isRetryAttempt: Boolean = false,
+    val wireTransmissionCount: Int = 0
+)
+
+data class RetriableRequest(
+    val command: ProtocolCommand,
+    val requestId: String,
+    val customPayload: JSONObject?,
+    val customCommandName: String?,
+    val timeoutMs: Long?
 )
 
 class ProtocolTestEngine(
@@ -80,6 +94,17 @@ class ProtocolTestEngine(
     private val _trafficLogs = MutableStateFlow<List<TrafficLogEntry>>(emptyList())
     val trafficLogs: StateFlow<List<TrafficLogEntry>> = _trafficLogs.asStateFlow()
 
+    // Capability discovery state representing currently connected Embedded session
+    private val _discoveredCapabilities = MutableStateFlow<com.mixion.protocoltest.core.protocol.DiscoveredCapabilities?>(null)
+    val discoveredCapabilities: StateFlow<com.mixion.protocoltest.core.protocol.DiscoveredCapabilities?> = _discoveredCapabilities.asStateFlow()
+
+    fun setDiscoveredCapabilities(capabilities: com.mixion.protocoltest.core.protocol.DiscoveredCapabilities?) {
+        _discoveredCapabilities.value = capabilities
+    }
+
+    // Retriable request cache preserving exact request_id across retries
+    private var lastRetriableRequest: RetriableRequest? = null
+
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
     private var testJob: Job? = null
     private val engineJob = kotlinx.coroutines.SupervisorJob()
@@ -106,10 +131,16 @@ class ProtocolTestEngine(
 
     fun setMockMode(useMock: Boolean) {
         if (_isMockMode.value != useMock) {
-            scope.launch {
-                activeTransport.disconnect()
-                _isMockMode.value = useMock
-                activeTransport.connect()
+            _isMockMode.value = useMock
+            _discoveredCapabilities.value = null
+            engineScope.launch(dispatcher) {
+                if (useMock) {
+                    usbTransport.disconnect()
+                    mockTransport.connect()
+                } else {
+                    mockTransport.disconnect()
+                    usbTransport.connect()
+                }
             }
         }
     }
@@ -132,7 +163,16 @@ class ProtocolTestEngine(
     fun clearCurrentTest() {
         testJob?.cancel()
         testJob = null
+        lastRetriableRequest = null
         _activeTest.value = ActiveTestState()
+    }
+
+    fun disconnect() {
+        scope.launch {
+            activeTransport.disconnect()
+            _discoveredCapabilities.value = null
+            lastRetriableRequest = null
+        }
     }
 
     fun executeTest(
@@ -140,7 +180,8 @@ class ProtocolTestEngine(
         customPayload: JSONObject? = null,
         customRequestId: String? = null,
         customCommandName: String? = null,
-        timeoutMs: Long? = null
+        timeoutMs: Long? = null,
+        isRetry: Boolean = false
     ): Job {
         testJob?.cancel()
         val job = scope.launch(dispatcher) {
@@ -155,12 +196,53 @@ class ProtocolTestEngine(
             val signedFrame = CanonicalJson.createSignedFrame(requestJson)
             val txHex = HexUtil.toHexString(signedFrame)
 
+            // Local Pre-Flight Gating: Validate against discovered capabilities before transmission!
+            val reqValidation = ProtocolValidator.validateRequest(
+                rawFrame = signedFrame,
+                expectedCommand = command,
+                capabilities = _discoveredCapabilities.value
+            )
+
+            if (!reqValidation.isPass) {
+                val errorMsg = "Local validation rejected request: ${reqValidation.failureReasons.joinToString("; ")}"
+                _activeTest.value = ActiveTestState(
+                    status = TestExecutionStatus.FAIL,
+                    command = command,
+                    requestId = reqId,
+                    rawTxString = "", // Blocked locally: not transmitted on wire
+                    rawTxHex = "",
+                    requestValidationReport = reqValidation,
+                    errorMessage = errorMsg,
+                    isRetriable = false, // Validation rejections must NOT be retried!
+                    isRetryAttempt = isRetry,
+                    wireTransmissionCount = 0
+                )
+                lastRetriableRequest = null
+                recordTestHistory(
+                    command = customCommandName ?: command.commandName,
+                    requestId = reqId,
+                    isPass = false,
+                    latencyMs = 0,
+                    txJson = signedFrame,
+                    rxJson = "",
+                    txHex = txHex,
+                    rxHex = "",
+                    summary = "REJECTED (Local Gating): ${reqValidation.failureReasons.firstOrNull()}",
+                    failureReasons = reqValidation.failureReasons
+                )
+                return@launch
+            }
+
             _activeTest.value = ActiveTestState(
                 status = TestExecutionStatus.SENDING,
                 command = command,
                 requestId = reqId,
                 rawTxString = signedFrame,
-                rawTxHex = txHex
+                rawTxHex = txHex,
+                requestValidationReport = reqValidation,
+                isRetriable = false,
+                isRetryAttempt = isRetry,
+                wireTransmissionCount = 1
             )
 
             val def = ProtocolRegistry.getDefinition(command)
@@ -169,9 +251,11 @@ class ProtocolTestEngine(
 
             val sendResult = activeTransport.sendFrame(signedFrame, reqId, command.commandName)
             if (sendResult.isFailure) {
+                lastRetriableRequest = RetriableRequest(command, reqId, customPayload, customCommandName, timeoutMs)
                 _activeTest.value = _activeTest.value.copy(
                     status = TestExecutionStatus.ERROR,
-                    errorMessage = "Send failed: ${sendResult.exceptionOrNull()?.message}"
+                    errorMessage = "Send failed: ${sendResult.exceptionOrNull()?.message}",
+                    isRetriable = true
                 )
                 return@launch
             }
@@ -180,13 +264,29 @@ class ProtocolTestEngine(
 
             // Special handling for DISPENSE: Expects ACCEPTED first, then COMPLETED or ERROR
             if (command == ProtocolCommand.DISPENSE) {
-                handleDispenseMultiResponse(signedFrame, txHex, reqId, sendTime, actualTimeout)
+                handleDispenseMultiResponse(signedFrame, txHex, reqId, sendTime, actualTimeout, customPayload, customCommandName, timeoutMs)
             } else {
-                handleStandardResponse(signedFrame, txHex, command, reqId, sendTime, actualTimeout)
+                handleStandardResponse(signedFrame, txHex, command, reqId, sendTime, actualTimeout, customPayload, customCommandName, timeoutMs)
             }
         }
         testJob = job
         return job
+    }
+
+    /**
+     * Retries the previous timed-out or transport-failed test.
+     * Crucial Protocol V1.0 Invariant: Strictly reuses the exact same request_id!
+     */
+    fun retryLastTest(): Job? {
+        val req = lastRetriableRequest ?: return null
+        return executeTest(
+            command = req.command,
+            customPayload = req.customPayload,
+            customRequestId = req.requestId, // Crucial: Reuses original request_id!
+            customCommandName = req.customCommandName,
+            timeoutMs = req.timeoutMs,
+            isRetry = true
+        )
     }
 
     private suspend fun handleStandardResponse(
@@ -195,7 +295,10 @@ class ProtocolTestEngine(
         command: ProtocolCommand,
         requestId: String,
         sendTime: Long,
-        timeoutMs: Long
+        timeoutMs: Long,
+        customPayload: JSONObject?,
+        customCommandName: String?,
+        originalTimeoutMs: Long?
     ) {
         val resultFrame = withTimeoutOrNull(timeoutMs) {
             activeTransport.receivedFramesFlow.first { frame ->
@@ -212,10 +315,12 @@ class ProtocolTestEngine(
         val latency = System.currentTimeMillis() - sendTime
 
         if (resultFrame == null) {
+            lastRetriableRequest = RetriableRequest(command, requestId, customPayload, customCommandName, originalTimeoutMs)
             _activeTest.value = _activeTest.value.copy(
                 status = TestExecutionStatus.TIMEOUT,
                 latencyMs = latency,
-                errorMessage = "No valid response received within $timeoutMs ms."
+                errorMessage = "No valid response received within $timeoutMs ms.",
+                isRetriable = true
             )
             recordTestHistory(
                 command = command.commandName,
@@ -235,14 +340,42 @@ class ProtocolTestEngine(
         val rxHex = HexUtil.toHexString(resultFrame)
         val report = ProtocolValidator.validateResponse(resultFrame, requestId, command)
 
+        // If response arrived, clear retry unless it's a transient transport failure
+        lastRetriableRequest = null
+
         _activeTest.value = _activeTest.value.copy(
             status = if (report.isPass) TestExecutionStatus.PASS else TestExecutionStatus.FAIL,
             rawRxString = resultFrame,
             rawRxHex = rxHex,
             latencyMs = latency,
             validationReport = report,
-            errorMessage = if (report.isPass) null else report.failureReasons.joinToString("\n")
+            errorMessage = if (report.isPass) null else report.failureReasons.joinToString("\n"),
+            isRetriable = false
         )
+
+        // Capability Caching & Session Lifecycle Updates
+        if (report.isPass && report.parsedMessage?.status == ProtocolStatus.OK) {
+            if (command == ProtocolCommand.CAPABILITIES) {
+                val payload = report.parsedMessage.payload
+                val pumpCount = payload.optInt("pump_count", 0)
+                val supportedPumps = mutableSetOf<Int>()
+                payload.optJSONArray("supported_pump_ids")?.let { arr ->
+                    for (i in 0 until arr.length()) supportedPumps.add(arr.getInt(i))
+                }
+                val cmds = mutableSetOf<String>()
+                payload.optJSONArray("commands")?.let { arr ->
+                    for (i in 0 until arr.length()) cmds.add(arr.getString(i))
+                }
+                _discoveredCapabilities.value = com.mixion.protocoltest.core.protocol.DiscoveredCapabilities(
+                    pumpCount = pumpCount,
+                    supportedPumpIds = supportedPumps,
+                    commands = cmds
+                )
+            } else if (command == ProtocolCommand.RESET) {
+                // Protocol V1.0: RESET invalidates active session state, requiring fresh handshake & discovery
+                _discoveredCapabilities.value = null
+            }
+        }
 
         recordTestHistory(
             command = command.commandName,
@@ -263,9 +396,12 @@ class ProtocolTestEngine(
         txHex: String,
         requestId: String,
         sendTime: Long,
-        timeoutMs: Long
+        timeoutMs: Long,
+        customPayload: JSONObject?,
+        customCommandName: String?,
+        originalTimeoutMs: Long?
     ) {
-        // Step 1: Wait for ACCEPTED response (within 3 seconds)
+        // Step 1: Wait for ACCEPTED response (within 3500 ms)
         val acceptedFrame = withTimeoutOrNull(3500) {
             activeTransport.receivedFramesFlow.first { frame ->
                 try {
@@ -279,10 +415,12 @@ class ProtocolTestEngine(
 
         if (acceptedFrame == null) {
             val latency = System.currentTimeMillis() - sendTime
+            lastRetriableRequest = RetriableRequest(ProtocolCommand.DISPENSE, requestId, customPayload, customCommandName, originalTimeoutMs)
             _activeTest.value = _activeTest.value.copy(
-                status = TestExecutionStatus.FAIL,
+                status = TestExecutionStatus.TIMEOUT,
                 latencyMs = latency,
-                errorMessage = "Expected initial 'ACCEPTED' response within 3500 ms."
+                errorMessage = "Expected initial 'ACCEPTED' response within 3500 ms (Timeout).",
+                isRetriable = true
             )
             recordTestHistory(
                 command = "DISPENSE",
@@ -293,8 +431,8 @@ class ProtocolTestEngine(
                 rxJson = "",
                 txHex = txHex,
                 rxHex = "",
-                summary = "FAIL: Missing initial ACCEPTED response",
-                failureReasons = listOf("Embedded did not return ACCEPTED status frame")
+                summary = "TIMEOUT: Missing initial ACCEPTED response",
+                failureReasons = listOf("Embedded did not return ACCEPTED status frame within 3500ms")
             )
             return
         }
@@ -302,13 +440,15 @@ class ProtocolTestEngine(
         val acceptedReport = ProtocolValidator.validateResponse(acceptedFrame, requestId, ProtocolCommand.DISPENSE)
         if (!acceptedReport.isPass) {
             val latency = System.currentTimeMillis() - sendTime
+            lastRetriableRequest = null
             _activeTest.value = _activeTest.value.copy(
                 status = TestExecutionStatus.FAIL,
                 rawRxString = acceptedFrame,
                 rawRxHex = HexUtil.toHexString(acceptedFrame),
                 latencyMs = latency,
                 validationReport = acceptedReport,
-                errorMessage = "ACCEPTED frame validation failed: ${acceptedReport.failureReasons.joinToString("; ")}"
+                errorMessage = "ACCEPTED frame validation failed: ${acceptedReport.failureReasons.joinToString("; ")}",
+                isRetriable = false
             )
             return
         }
@@ -316,8 +456,11 @@ class ProtocolTestEngine(
         // Step 2: Now wait for terminal COMPLETED or ERROR response
         _activeTest.value = _activeTest.value.copy(
             status = TestExecutionStatus.DISPENSE_ACCEPTED_EXECUTING,
-            rawRxString = ">>> [Phase 1: ACCEPTED]\n$acceptedFrame\n>>> Waiting for COMPLETED...",
-            latencyMs = System.currentTimeMillis() - sendTime
+            rawRxString = acceptedFrame,
+            dispensePhase1RxFrame = acceptedFrame,
+            dispensePhase2RxFrame = null,
+            latencyMs = System.currentTimeMillis() - sendTime,
+            isRetriable = false
         )
 
         val terminalFrame = withTimeoutOrNull(timeoutMs) {
@@ -336,10 +479,12 @@ class ProtocolTestEngine(
         val totalLatency = System.currentTimeMillis() - sendTime
 
         if (terminalFrame == null) {
+            lastRetriableRequest = RetriableRequest(ProtocolCommand.DISPENSE, requestId, customPayload, customCommandName, originalTimeoutMs)
             _activeTest.value = _activeTest.value.copy(
                 status = TestExecutionStatus.TIMEOUT,
                 latencyMs = totalLatency,
-                errorMessage = "Dispense timed out waiting for COMPLETED/ERROR within $timeoutMs ms."
+                errorMessage = "Dispense timed out waiting for COMPLETED/ERROR within $timeoutMs ms.",
+                isRetriable = true
             )
             recordTestHistory(
                 command = "DISPENSE",
@@ -357,15 +502,18 @@ class ProtocolTestEngine(
         }
 
         val terminalReport = ProtocolValidator.validateResponse(terminalFrame, requestId, ProtocolCommand.DISPENSE)
-        val combinedRx = "Phase 1 (ACCEPTED):\n$acceptedFrame\nPhase 2 (${terminalReport.parsedMessage?.status?.value}):\n$terminalFrame"
+        lastRetriableRequest = null
 
         _activeTest.value = _activeTest.value.copy(
             status = if (terminalReport.isPass) TestExecutionStatus.PASS else TestExecutionStatus.FAIL,
-            rawRxString = combinedRx,
+            rawRxString = terminalFrame,
             rawRxHex = HexUtil.toHexString(terminalFrame),
+            dispensePhase1RxFrame = acceptedFrame,
+            dispensePhase2RxFrame = terminalFrame,
             latencyMs = totalLatency,
             validationReport = terminalReport,
-            errorMessage = if (terminalReport.isPass) null else terminalReport.failureReasons.joinToString("\n")
+            errorMessage = if (terminalReport.isPass) null else terminalReport.failureReasons.joinToString("\n"),
+            isRetriable = false
         )
 
         recordTestHistory(
@@ -374,7 +522,7 @@ class ProtocolTestEngine(
             isPass = terminalReport.isPass,
             latencyMs = totalLatency,
             txJson = txFrame,
-            rxJson = combinedRx,
+            rxJson = "${acceptedFrame.trimEnd()}\n${terminalFrame.trimEnd()}\n",
             txHex = txHex,
             rxHex = HexUtil.toHexString(terminalFrame),
             summary = if (terminalReport.isPass) "PASS: ACCEPTED -> COMPLETED" else "FAIL: ${terminalReport.failureReasons.firstOrNull()}",

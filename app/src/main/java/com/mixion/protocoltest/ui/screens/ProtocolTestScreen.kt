@@ -1,5 +1,8 @@
 package com.mixion.protocoltest.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
@@ -16,16 +19,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.FactCheck
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -45,7 +49,7 @@ import com.mixion.protocoltest.ui.theme.*
 @Composable
 fun ProtocolTestScreen(viewModel: ProtocolTestViewModel) {
     val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
 
     val isMockMode by viewModel.isMockMode.collectAsState()
     val connectionState by viewModel.connectionState.collectAsState()
@@ -67,6 +71,7 @@ fun ProtocolTestScreen(viewModel: ProtocolTestViewModel) {
 
     val showDispenseConfirmation by viewModel.showDispenseConfirmation.collectAsState()
     val selectedHistoryDetails by viewModel.selectedHistoryDetails.collectAsState()
+    val discoveredCapabilities by viewModel.discoveredCapabilities.collectAsState()
 
     var showHistorySheet by remember { mutableStateOf(false) }
 
@@ -156,12 +161,14 @@ fun ProtocolTestScreen(viewModel: ProtocolTestViewModel) {
                 onCustomPayloadChange = { viewModel.setCustomPayloadJson(it) },
                 requestPreview = viewModel.getRequestPreview(),
                 activeTest = activeTest,
+                discoveredCapabilities = discoveredCapabilities,
                 onSend = { viewModel.sendRequest() }
             )
 
             // Section 3: Response & Validation Result
             ValidationResultSection(
-                activeTest = activeTest
+                activeTest = activeTest,
+                onRetry = { viewModel.retryLastRequest() }
             )
 
             // Section 4: Live Raw Traffic Monitor
@@ -172,7 +179,8 @@ fun ProtocolTestScreen(viewModel: ProtocolTestViewModel) {
                     val text = trafficLogs.joinToString("\n") {
                         "[${it.timestamp}] ${it.direction} (${it.bytesCount}B)${it.latencyMs?.let { l -> " ${l}ms" } ?: ""}\n${it.asciiContent.trim()}"
                     }
-                    clipboardManager.setText(AnnotatedString(text))
+                    val clip = ClipData.newPlainText("Mixion Traffic", text)
+                    clipboard?.setPrimaryClip(clip)
                     Toast.makeText(context, "Traffic logs copied to clipboard", Toast.LENGTH_SHORT).show()
                 }
             )
@@ -252,7 +260,7 @@ fun ProtocolTestScreen(viewModel: ProtocolTestViewModel) {
                     Text("Request ID: ${item.requestId}", fontSize = 12.sp, color = TextSecondary)
                     Text("Latency: ${item.latencyMs} ms", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
 
-                    Divider(modifier = Modifier.padding(vertical = 4.dp))
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
                     Text("Request (TX):", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                     Text(
                         item.requestJson,
@@ -351,6 +359,7 @@ fun ConnectionSection(
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            // Header: Title with Icon and Connection State Badge
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -359,14 +368,83 @@ fun ConnectionSection(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Connection & Transport", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Spacer(modifier = Modifier.weight(1f))
+                ConnectionStatusChip(state = connectionState)
+            }
 
-                // Mode Toggle
-                Text(if (isMockMode) "Mock Controller" else "USB Hardware", fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                Spacer(modifier = Modifier.width(8.dp))
-                Switch(
-                    checked = isMockMode,
-                    onCheckedChange = { onToggleMock(it) }
-                )
+            // Transport Mode Selector: 2 Segmented Tabs that will NEVER clip or collide
+            Surface(
+                color = CodeBg,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    // Mock Simulator Tab
+                    Surface(
+                        color = if (isMockMode) CardBg else Color.Transparent,
+                        shape = RoundedCornerShape(6.dp),
+                        border = if (isMockMode) BorderStroke(1.dp, PrimaryBlue.copy(alpha = 0.4f)) else null,
+                        shadowElevation = if (isMockMode) 1.dp else 0.dp,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onToggleMock(true) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                Icons.Default.Memory,
+                                contentDescription = null,
+                                tint = if (isMockMode) PrimaryBlue else TextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "Mock ESP32",
+                                fontWeight = if (isMockMode) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 13.sp,
+                                color = if (isMockMode) PrimaryBlue else TextSecondary
+                            )
+                        }
+                    }
+
+                    // Physical USB Tab
+                    Surface(
+                        color = if (!isMockMode) CardBg else Color.Transparent,
+                        shape = RoundedCornerShape(6.dp),
+                        border = if (!isMockMode) BorderStroke(1.dp, PrimaryBlue.copy(alpha = 0.4f)) else null,
+                        shadowElevation = if (!isMockMode) 1.dp else 0.dp,
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onToggleMock(false) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                Icons.Default.Cable,
+                                contentDescription = null,
+                                tint = if (!isMockMode) PrimaryBlue else TextSecondary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "Physical USB",
+                                fontWeight = if (!isMockMode) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 13.sp,
+                                color = if (!isMockMode) PrimaryBlue else TextSecondary
+                            )
+                        }
+                    }
+                }
             }
 
             if (isMockMode) {
@@ -380,17 +458,17 @@ fun ConnectionSection(
                         modifier = Modifier.padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Default.Memory, contentDescription = null, tint = PrimaryBlue)
+                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                "Mock Controller Active",
+                                "Mock Controller Active (ESP32 V1.0)",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp,
                                 color = PrimaryBlue
                             )
                             Text(
-                                "Simulates ESP32 Embedded Brain V1.0 with Section 39 max-3-pump concurrent execution.",
+                                "Simulates MIXION Embedded Brain V1.0 with Section 39 max-3-pump concurrent execution & CRC32 ISO-HDLC integrity.",
                                 fontSize = 12.sp,
                                 color = TextSecondary
                             )
@@ -416,7 +494,7 @@ fun ConnectionSection(
                             readOnly = true,
                             label = { Text("USB Device") },
                             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedDevDropdown) },
-                            modifier = Modifier.menuAnchor().fillMaxWidth(),
+                            modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable).fillMaxWidth(),
                             singleLine = true,
                             textStyle = LocalTextStyle.current.copy(fontSize = 13.sp)
                         )
@@ -508,6 +586,7 @@ fun ProtocolSelectionSection(
     onCustomPayloadChange: (String) -> Unit,
     requestPreview: com.mixion.protocoltest.ui.RequestPreviewData,
     activeTest: com.mixion.protocoltest.domain.test.ActiveTestState,
+    discoveredCapabilities: com.mixion.protocoltest.core.protocol.DiscoveredCapabilities? = null,
     onSend: () -> Unit
 ) {
     var expandedCmdDropdown by remember { mutableStateOf(false) }
@@ -521,9 +600,51 @@ fun ProtocolSelectionSection(
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Send, contentDescription = null, tint = PrimaryBlue)
+                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null, tint = PrimaryBlue)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Protocol Request Builder", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+            }
+
+            // Embedded Capabilities Status Banner
+            Surface(
+                color = if (discoveredCapabilities != null) PassGreenBg else Color(0xFFF1F5F9),
+                shape = RoundedCornerShape(8.dp),
+                border = BorderStroke(1.dp, if (discoveredCapabilities != null) PassGreenBorder else Color(0xFFCBD5E1)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        if (discoveredCapabilities != null) Icons.Default.CheckCircle else Icons.Default.Info,
+                        contentDescription = null,
+                        tint = if (discoveredCapabilities != null) PassGreen else TextSecondary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column {
+                        Text(
+                            if (discoveredCapabilities != null)
+                                "Discovered Capabilities: ${discoveredCapabilities.pumpCount} Pumps (${discoveredCapabilities.supportedPumpIds})"
+                            else
+                                "Capabilities: Undiscovered (Run HELLO / CAPABILITIES)",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp,
+                            color = if (discoveredCapabilities != null) PassGreen else TextSecondary
+                        )
+                        if (discoveredCapabilities != null) {
+                            Text(
+                                "Supported Commands: ${discoveredCapabilities.commands.joinToString(", ")}",
+                                fontSize = 11.sp,
+                                color = TextSecondary
+                            )
+                        } else {
+                            Text(
+                                "DISPENSE pump IDs will be capability-gated once discovered.",
+                                fontSize = 11.sp,
+                                color = TextSecondary
+                            )
+                        }
+                    }
+                }
             }
 
             // Command Dropdown
@@ -533,12 +654,12 @@ fun ProtocolSelectionSection(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 OutlinedTextField(
-                    value = selectedCommand.displayName,
+                    value = if (selectedCommand == ProtocolCommand.CUSTOM) "CUSTOM [Diagnostic Mode]" else selectedCommand.displayName,
                     onValueChange = {},
                     readOnly = true,
                     label = { Text("Select Protocol Command") },
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedCmdDropdown) },
-                    modifier = Modifier.menuAnchor().fillMaxWidth()
+                    modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable).fillMaxWidth()
                 )
                 ExposedDropdownMenu(
                     expanded = expandedCmdDropdown,
@@ -548,12 +669,21 @@ fun ProtocolSelectionSection(
                         DropdownMenuItem(
                             text = {
                                 Column {
-                                    Text(cmd.displayName, fontWeight = FontWeight.SemiBold)
-                                    Text(
-                                        ProtocolRegistry.getDefinition(cmd).description,
-                                        fontSize = 11.sp,
-                                        color = TextSecondary
-                                    )
+                                    if (cmd.isTesterDiagnosticOnly) {
+                                        Text("${cmd.displayName} [Diagnostic Mode]", fontWeight = FontWeight.SemiBold, color = WarnAmber)
+                                        Text(
+                                            "Tester diagnostic tool — NOT a normative V1.0 protocol command.",
+                                            fontSize = 11.sp,
+                                            color = WarnAmber
+                                        )
+                                    } else {
+                                        Text(cmd.displayName, fontWeight = FontWeight.SemiBold)
+                                        Text(
+                                            ProtocolRegistry.getDefinition(cmd).description,
+                                            fontSize = 11.sp,
+                                            color = TextSecondary
+                                        )
+                                    }
                                 }
                             },
                             onClick = {
@@ -703,44 +833,98 @@ fun ProtocolSelectionSection(
                 }
             }
 
-            // Live Request Preview Accordion
+            // Exact Wire Request Preview & CRC32 Verification
+            val clipManager = LocalContext.current.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val previewContext = LocalContext.current
+
             Surface(
                 color = CodeBg,
-                shape = RoundedCornerShape(8.dp),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, PrimaryBlue.copy(alpha = 0.25f)),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Column(modifier = Modifier.padding(10.dp)) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { showPreviewDetails = !showPreviewDetails },
+                        modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Wire Request Preview", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        Icon(Icons.Default.Terminal, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Exact Wire Command to Send (NDJSON)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
                         Spacer(modifier = Modifier.weight(1f))
-                        Text("CRC32: ${requestPreview.crc32}", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, color = PrimaryBlue, fontSize = 12.sp)
-                        Icon(
-                            if (showPreviewDetails) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
+                        Surface(
+                            color = if (requestPreview.validationReport.isPass) PassGreenBg else FailRedBg,
+                            shape = RoundedCornerShape(4.dp),
+                            border = BorderStroke(1.dp, if (requestPreview.validationReport.isPass) PassGreenBorder else FailRedBorder)
+                        ) {
+                            Text(
+                                if (requestPreview.validationReport.isPass) "VALID MIXION V1.0" else "INVALID SCHEMA",
+                                color = if (requestPreview.validationReport.isPass) PassGreen else FailRed,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(6.dp))
+                        IconButton(
+                            onClick = {
+                                clipManager?.setPrimaryClip(ClipData.newPlainText("Wire Request", requestPreview.finalNdjsonFrame))
+                                Toast.makeText(previewContext, "Exact command copied to clipboard", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = "Copy Command", modifier = Modifier.size(16.dp), tint = PrimaryBlue)
+                        }
+                    }
+
+                    // Monospace Exact Frame Display (Dark Terminal Background)
+                    Surface(
+                        color = Color(0xFF0F172A),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = requestPreview.finalNdjsonFrame.trimEnd(),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 12.sp,
+                            color = Color(0xFFF8FAFC),
+                            modifier = Modifier.padding(10.dp)
                         )
                     }
 
-                    AnimatedVisibility(visible = showPreviewDetails) {
-                        Column(modifier = Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("Canonical JSON:", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    // Checksum & Integrity Details
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(CardBg, RoundedCornerShape(6.dp))
+                            .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(6.dp))
+                            .padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Algorithm: ", fontSize = 10.sp, color = TextSecondary)
+                            Text("CRC-32/ISO-HDLC", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text("Checksum: ", fontSize = 10.sp, color = TextSecondary)
+                            Text(requestPreview.crc32, fontFamily = FontFamily.Monospace, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue)
+                            Spacer(modifier = Modifier.weight(1f))
+                            Text("Delimiter: LF (\\n)", fontFamily = FontFamily.Monospace, fontSize = 10.sp, color = TextSecondary)
+                        }
+
+                        Text("Canonical JSON (CRC Input without crc32):", fontSize = 10.sp, fontWeight = FontWeight.Medium, color = TextSecondary)
+                        Text(
+                            requestPreview.canonicalWithoutCrc,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = DarkSlate
+                        )
+
+                        if (!requestPreview.validationReport.isPass) {
                             Text(
-                                requestPreview.finalNdjsonFrame.trim(),
-                                fontFamily = FontFamily.Monospace,
+                                "Format issues: ${requestPreview.validationReport.failureReasons.joinToString(", ")}",
                                 fontSize = 11.sp,
-                                color = TextPrimary
-                            )
-                            Text("Raw TX Hex:", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Text(
-                                requestPreview.rawTxHex,
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 10.sp,
-                                color = TextSecondary
+                                color = FailRed,
+                                fontWeight = FontWeight.Medium
                             )
                         }
                     }
@@ -795,8 +979,12 @@ fun ProtocolSelectionSection(
 
 @Composable
 fun ValidationResultSection(
-    activeTest: com.mixion.protocoltest.domain.test.ActiveTestState
+    activeTest: com.mixion.protocoltest.domain.test.ActiveTestState,
+    onRetry: () -> Unit = {}
 ) {
+    val context = LocalContext.current
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = CardBg),
@@ -805,12 +993,35 @@ fun ValidationResultSection(
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.FactCheck, contentDescription = null, tint = PrimaryBlue)
+                Icon(Icons.AutoMirrored.Filled.FactCheck, contentDescription = null, tint = PrimaryBlue)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text("Response & Protocol Validation", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Spacer(modifier = Modifier.weight(1f))
                 if (activeTest.latencyMs > 0) {
                     Text("${activeTest.latencyMs} ms", fontFamily = FontFamily.Monospace, fontSize = 12.sp, color = TextSecondary)
+                }
+            }
+
+            // Retry Attempt Notification Badge
+            if (activeTest.isRetryAttempt) {
+                Surface(
+                    color = Color(0xFFFEF3C7),
+                    shape = RoundedCornerShape(6.dp),
+                    border = BorderStroke(1.dp, WarnAmber)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null, tint = WarnAmber, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "RETRY ATTEMPT: Preserving original request_id [${activeTest.requestId}] per V1.0 idempotency specification.",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 11.sp,
+                            color = Color(0xFF78350F)
+                        )
+                    }
                 }
             }
 
@@ -909,10 +1120,259 @@ fun ValidationResultSection(
                 }
             }
 
+            // Retry UI Button or Non-Retriable Notice
+            if (activeTest.isRetriable) {
+                Surface(
+                    color = Color(0xFFFFFBEB),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, WarnAmber.copy(alpha = 0.6f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, tint = WarnAmber, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Retryable Condition Detected", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF92400E))
+                        }
+                        Text(
+                            "Per Protocol V1.0 specification, a retry reuses the original request_id (${activeTest.requestId}) to ensure idempotency and prevent duplicate execution.",
+                            fontSize = 11.sp,
+                            color = Color(0xFF78350F)
+                        )
+                        Button(
+                            onClick = onRetry,
+                            colors = ButtonDefaults.buttonColors(containerColor = WarnAmber),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("RETRY OPERATION (Reuses ${activeTest.requestId})", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            } else if (activeTest.status == TestExecutionStatus.FAIL || activeTest.status == TestExecutionStatus.ERROR) {
+                Text(
+                    "Non-retriable: Protocol schema validation failure or capability rejection. Per Protocol V1.0, invalid requests must NOT be retried on the wire.",
+                    fontSize = 11.sp,
+                    color = FailRed,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
+            // EXACT RECEIVED WIRE RESPONSE(S) - OPEN BY DEFAULT!
+            if (activeTest.command == ProtocolCommand.DISPENSE) {
+                // Phase 1 Response Frame
+                if (!activeTest.dispensePhase1RxFrame.isNullOrBlank()) {
+                    Surface(
+                        color = CodeBg,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, PrimaryBlue.copy(alpha = 0.2f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Phase 1 Wire Response: ACCEPTED", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = PrimaryBlue)
+                                Spacer(modifier = Modifier.weight(1f))
+                                IconButton(
+                                    onClick = {
+                                        clipboard?.setPrimaryClip(ClipData.newPlainText("Phase 1 Frame", activeTest.dispensePhase1RxFrame))
+                                        Toast.makeText(context, "Phase 1 frame copied", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.size(22.dp)
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy", modifier = Modifier.size(14.dp), tint = PrimaryBlue)
+                                }
+                            }
+                            Surface(
+                                color = Color(0xFF0F172A),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = activeTest.dispensePhase1RxFrame.trimEnd(),
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFF8FAFC),
+                                    modifier = Modifier.padding(8.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Phase 2 Response Frame
+                if (!activeTest.dispensePhase2RxFrame.isNullOrBlank()) {
+                    Surface(
+                        color = CodeBg,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, PassGreen.copy(alpha = 0.2f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            val isCompleted = activeTest.dispensePhase2RxFrame.contains("COMPLETED")
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    if (isCompleted) "Phase 2 Wire Response: COMPLETED" else "Phase 2 Wire Response: ERROR",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp,
+                                    color = if (isCompleted) PassGreen else FailRed
+                                )
+                                Spacer(modifier = Modifier.weight(1f))
+                                IconButton(
+                                    onClick = {
+                                        clipboard?.setPrimaryClip(ClipData.newPlainText("Phase 2 Frame", activeTest.dispensePhase2RxFrame))
+                                        Toast.makeText(context, "Phase 2 frame copied", Toast.LENGTH_SHORT).show()
+                                    },
+                                    modifier = Modifier.size(22.dp)
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy", modifier = Modifier.size(14.dp), tint = PrimaryBlue)
+                                }
+                            }
+                            Surface(
+                                color = Color(0xFF0F172A),
+                                shape = RoundedCornerShape(4.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = activeTest.dispensePhase2RxFrame.trimEnd(),
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    color = Color(0xFFF8FAFC),
+                                    modifier = Modifier.padding(8.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            } else if (activeTest.rawRxString.isNotBlank()) {
+                // Standard command response frame
+                Surface(
+                    color = CodeBg,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, RxTeal.copy(alpha = 0.2f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Terminal, contentDescription = null, tint = RxTeal, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Exact Wire Response Received (RX)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            Spacer(modifier = Modifier.weight(1f))
+                            IconButton(
+                                onClick = {
+                                    clipboard?.setPrimaryClip(ClipData.newPlainText("Received Frame", activeTest.rawRxString))
+                                    Toast.makeText(context, "Exact response frame copied", Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.size(22.dp)
+                            ) {
+                                Icon(Icons.Default.ContentCopy, contentDescription = "Copy", modifier = Modifier.size(14.dp), tint = PrimaryBlue)
+                            }
+                        }
+                        Surface(
+                            color = Color(0xFF0F172A),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = activeTest.rawRxString.trimEnd(),
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                color = Color(0xFFF8FAFC),
+                                modifier = Modifier.padding(8.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // CRC32 INTEGRITY & RESPONSE CHECKSUM VERIFICATION CARD
+            activeTest.validationReport?.crcResult?.let { crc ->
+                Surface(
+                    color = if (crc.isValid) PassGreenBg else FailRedBg,
+                    border = BorderStroke(1.dp, if (crc.isValid) PassGreenBorder else FailRedBorder),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                if (crc.isValid) Icons.Default.CheckCircle else Icons.Default.Cancel,
+                                contentDescription = null,
+                                tint = if (crc.isValid) PassGreen else FailRed,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "Response CRC32 Verification",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp,
+                                color = if (crc.isValid) PassGreen else FailRed
+                            )
+                            Spacer(modifier = Modifier.weight(1f))
+                            Surface(
+                                color = if (crc.isValid) PassGreen else FailRed,
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    if (crc.isValid) "MATCH" else "MISMATCH",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Received Checksum in Frame:", fontSize = 10.sp, color = TextSecondary)
+                                Text(
+                                    crc.receivedCrc ?: "Missing",
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp,
+                                    color = if (crc.isValid) TextPrimary else FailRed
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Calculated CRC-32/ISO-HDLC:", fontSize = 10.sp, color = TextSecondary)
+                                Text(
+                                    crc.calculatedCrc ?: "N/A",
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp,
+                                    color = PassGreen
+                                )
+                            }
+                        }
+
+                        if (!crc.canonicalJson.isNullOrBlank()) {
+                            Text("Canonical JSON Input for CRC Verification:", fontSize = 10.sp, fontWeight = FontWeight.Medium, color = TextSecondary)
+                            Text(
+                                crc.canonicalJson,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                color = DarkSlate,
+                                maxLines = 4
+                            )
+                        }
+
+                        if (!crc.isValid && !crc.errorMessage.isNullOrBlank()) {
+                            Text(
+                                "Error: ${crc.errorMessage}",
+                                fontSize = 11.sp,
+                                color = FailRed,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+
             // Checklist of validation items if report available
             activeTest.validationReport?.let { report ->
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Validation Checklist:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("Wire Contract Validation Checklist:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     report.checks.forEach { check ->
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(
@@ -930,52 +1390,6 @@ fun ValidationResultSection(
                                 color = if (check.isPassed) TextSecondary else FailRed,
                                 fontFamily = FontFamily.Monospace
                             )
-                        }
-                    }
-                }
-            }
-
-            // Raw RX section
-            if (activeTest.rawRxString.isNotBlank()) {
-                var showRxExpanded by remember { mutableStateOf(false) }
-                Surface(
-                    color = CodeBg,
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Column(modifier = Modifier.padding(10.dp)) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { showRxExpanded = !showRxExpanded },
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("Received Response (RX)", fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
-                            Spacer(modifier = Modifier.weight(1f))
-                            Icon(
-                                if (showRxExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        AnimatedVisibility(visible = showRxExpanded) {
-                            Column(modifier = Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    activeTest.rawRxString,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                    color = TextPrimary
-                                )
-                                if (activeTest.rawRxHex.isNotBlank()) {
-                                    Text("Raw RX Hex:", fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                    Text(
-                                        activeTest.rawRxHex,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 10.sp,
-                                        color = TextSecondary
-                                    )
-                                }
-                            }
                         }
                     }
                 }
@@ -1020,7 +1434,7 @@ fun LiveTrafficSection(
                 }
             }
 
-            Divider(modifier = Modifier.padding(vertical = 8.dp))
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
             if (trafficLogs.isEmpty()) {
                 Box(
@@ -1048,6 +1462,9 @@ fun LiveTrafficSection(
 
 @Composable
 fun TrafficRow(entry: TrafficLogEntry) {
+    val context = LocalContext.current
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+
     val (dirColor, dirBg) = when (entry.direction) {
         TrafficDirection.TX -> Pair(TxBlue, Color(0xFFEFF6FF))
         TrafficDirection.RX -> Pair(RxTeal, Color(0xFFF0FDFA))
@@ -1095,6 +1512,23 @@ fun TrafficRow(entry: TrafficLogEntry) {
                     Text("${it}ms", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = dirColor)
                 }
                 Spacer(modifier = Modifier.weight(1f))
+
+                // One-tap copy for packet
+                IconButton(
+                    onClick = {
+                        clipboard?.setPrimaryClip(ClipData.newPlainText("Packet", entry.asciiContent))
+                        Toast.makeText(context, "Packet copied", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier.size(20.dp)
+                ) {
+                    Icon(
+                        Icons.Default.ContentCopy,
+                        contentDescription = "Copy Packet",
+                        modifier = Modifier.size(13.dp),
+                        tint = TextSecondary
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
                 Icon(
                     if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                     contentDescription = null,
@@ -1108,7 +1542,6 @@ fun TrafficRow(entry: TrafficLogEntry) {
                 entry.asciiContent.trim(),
                 fontFamily = FontFamily.Monospace,
                 fontSize = 11.sp,
-                maxLines = if (expanded) Int.MAX_VALUE else 2,
                 color = TextPrimary
             )
 
@@ -1145,7 +1578,7 @@ fun TestHistorySheetContent(
             }
         }
 
-        Divider(modifier = Modifier.padding(vertical = 8.dp))
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
         if (history.isEmpty()) {
             Box(

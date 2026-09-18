@@ -25,10 +25,32 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+data class MockTransaction(
+    val requestId: String,
+    val command: String,
+    var status: String,
+    var phase1Frame: String?,
+    var terminalFrame: String?,
+    var isCompleted: Boolean = false
+)
+
+data class PumpScheduleEvent(
+    val eventType: String, // "STARTED" or "COMPLETED"
+    val pumpId: Int,
+    val durationMs: Long,
+    val elapsedVirtualTimeMs: Long
+)
+
+data class ActivePump(
+    val pumpId: Int,
+    val initialDurationMs: Long,
+    var remainingDurationMs: Long
+)
+
 /**
  * High-fidelity Mock Embedded Controller simulating the MIXION Embedded Brain V1.0.
  * Implements CRC32 verification, error handling, state transitions,
- * and Section 39 concurrent pump dispensing.
+ * session-level duplicate protection, and Section 39 discrete concurrent pump scheduling.
  */
 class MockEmbeddedTransport(
     private val scope: CoroutineScope,
@@ -48,6 +70,12 @@ class MockEmbeddedTransport(
     private var activeDispenseJob: Job? = null
     private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
+    // Session duplicate protection & scheduler event tracking
+    val transactionMap = java.util.concurrent.ConcurrentHashMap<String, MockTransaction>()
+    val physicalExecutionCountMap = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+    val schedulerEvents = java.util.Collections.synchronizedList(mutableListOf<PumpScheduleEvent>())
+    var timeScaleFactor: Double = 1.0
+
     override suspend fun connect(): Result<Unit> {
         _connectionState.value = ConnectionState.CONNECTING
         delay(100)
@@ -66,6 +94,9 @@ class MockEmbeddedTransport(
         activeDispenseJob?.cancel()
         activeDispenseJob = null
         machineState = MachineOperationalState.IDLE
+        transactionMap.clear()
+        physicalExecutionCountMap.clear()
+        schedulerEvents.clear()
         _connectionState.value = ConnectionState.OFFLINE
         emitLog(
             direction = TrafficDirection.INFO,
@@ -137,7 +168,23 @@ class MockEmbeddedTransport(
             return
         }
 
-        // 3. Process Command
+        // 3. Duplicate Transaction Protection (Protocol V1.0 Section 17 & 18):
+        // The same request_id represents the same logical transaction.
+        // If a duplicate arrives, return existing transaction state without executing twice.
+        val existingTx = transactionMap[reqId]
+        if (existingTx != null) {
+            if (!existingTx.isCompleted && existingTx.phase1Frame != null) {
+                // Operation is still in progress: re-emit existing ACCEPTED frame
+                sendResponseFromEmbedded(existingTx.phase1Frame!!, sendTime, reqId, cmdStr, "ACCEPTED")
+                return
+            } else if (existingTx.isCompleted && existingTx.terminalFrame != null) {
+                // Operation has completed: re-emit existing COMPLETED frame
+                sendResponseFromEmbedded(existingTx.terminalFrame!!, sendTime, reqId, cmdStr, "COMPLETED")
+                return
+            }
+        }
+
+        // 4. Process Command
         when (cmdStr.uppercase()) {
             "HELLO" -> {
                 val resp = JSONObject().apply {
@@ -153,7 +200,9 @@ class MockEmbeddedTransport(
                         put("protocol_version", 1)
                     })
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "ACCEPTED")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                transactionMap[reqId] = MockTransaction(reqId, "HELLO", "ACCEPTED", signedFrame, signedFrame, true)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "ACCEPTED")
             }
 
             "CAPABILITIES" -> {
@@ -176,7 +225,9 @@ class MockEmbeddedTransport(
                         put("commands", cmds)
                     })
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "OK")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                transactionMap[reqId] = MockTransaction(reqId, "CAPABILITIES", "OK", signedFrame, signedFrame, true)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "OK")
             }
 
             "STATUS" -> {
@@ -190,7 +241,9 @@ class MockEmbeddedTransport(
                         put("state", machineState.name)
                     })
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "OK")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                transactionMap[reqId] = MockTransaction(reqId, "STATUS", "OK", signedFrame, signedFrame, true)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "OK")
             }
 
             "GLASS_STATUS" -> {
@@ -204,7 +257,9 @@ class MockEmbeddedTransport(
                         put("glass_present", true)
                     })
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "OK")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                transactionMap[reqId] = MockTransaction(reqId, "GLASS_STATUS", "OK", signedFrame, signedFrame, true)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "OK")
             }
 
             "HEARTBEAT" -> {
@@ -219,7 +274,9 @@ class MockEmbeddedTransport(
                         put("power_mode", "direct")
                     })
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "OK")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                transactionMap[reqId] = MockTransaction(reqId, "HEARTBEAT", "OK", signedFrame, signedFrame, true)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "OK")
             }
 
             "STOP" -> {
@@ -234,13 +291,17 @@ class MockEmbeddedTransport(
                     put("status", "COMPLETED")
                     put("payload", JSONObject())
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "COMPLETED")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                transactionMap[reqId] = MockTransaction(reqId, "STOP", "COMPLETED", signedFrame, signedFrame, true)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "COMPLETED")
             }
 
             "RESET" -> {
                 activeDispenseJob?.cancel()
                 activeDispenseJob = null
                 machineState = MachineOperationalState.IDLE
+                transactionMap.clear()
+                schedulerEvents.clear()
                 val resp = JSONObject().apply {
                     put("version", 1)
                     put("type", "response")
@@ -249,7 +310,8 @@ class MockEmbeddedTransport(
                     put("status", "COMPLETED")
                     put("payload", JSONObject())
                 }
-                sendResponseFromEmbedded(CanonicalJson.createSignedFrame(resp), sendTime, reqId, cmdStr, "COMPLETED")
+                val signedFrame = CanonicalJson.createSignedFrame(resp)
+                sendResponseFromEmbedded(signedFrame, sendTime, reqId, cmdStr, "COMPLETED")
             }
 
             "DISPENSE" -> {
@@ -295,6 +357,10 @@ class MockEmbeddedTransport(
             pumpList.add(Pair(pid, dur))
         }
 
+        // Track simulated physical execution count (must be exactly 1 even if duplicates arrive)
+        val execCounter = physicalExecutionCountMap.computeIfAbsent(reqId) { java.util.concurrent.atomic.AtomicInteger(0) }
+        execCounter.incrementAndGet()
+
         // Section 17: Embedded commits and immediately returns ACCEPTED + CRC32
         val acceptedResp = JSONObject().apply {
             put("version", 1)
@@ -305,16 +371,26 @@ class MockEmbeddedTransport(
             put("payload", JSONObject())
         }
         val acceptedFrame = CanonicalJson.createSignedFrame(acceptedResp)
+        val txRecord = MockTransaction(
+            requestId = reqId,
+            command = "DISPENSE",
+            status = "ACCEPTED",
+            phase1Frame = acceptedFrame,
+            terminalFrame = null,
+            isCompleted = false
+        )
+        transactionMap[reqId] = txRecord
+
         sendResponseFromEmbedded(acceptedFrame, sendTime, reqId, "DISPENSE", "ACCEPTED")
 
-        // Section 18 & Section 39 Note: Execution simulation
+        // Section 18 & Section 39: Discrete concurrent pump execution simulation
         machineState = MachineOperationalState.DISPENSING
         _connectionState.value = ConnectionState.BUSY
 
         activeDispenseJob = scope.launch(dispatcher) {
             try {
-                // Execute pumps with max 3 concurrent pumps algorithm
-                simulateConcurrentDispense(pumpList)
+                // Execute pumps with discrete max 3 concurrent pumps algorithm
+                executeDiscreteMax3Scheduler(pumpList)
 
                 // On completion: Send COMPLETED + CRC32
                 machineState = MachineOperationalState.IDLE
@@ -331,29 +407,76 @@ class MockEmbeddedTransport(
                     })
                 }
                 val completedFrame = CanonicalJson.createSignedFrame(completedResp)
+                txRecord.status = "COMPLETED"
+                txRecord.terminalFrame = completedFrame
+                txRecord.isCompleted = true
+
                 sendResponseFromEmbedded(completedFrame, sendTime, reqId, "DISPENSE", "COMPLETED")
             } catch (_: kotlinx.coroutines.CancellationException) {
                 // Cancelled by STOP
             } catch (e: Exception) {
                 machineState = MachineOperationalState.ERROR
                 val errFrame = buildErrorResponse(reqId, "DISPENSE", ProtocolErrorCode.E006, "Pump execution failed: ${e.message}")
+                txRecord.status = "ERROR"
+                txRecord.terminalFrame = errFrame
+                txRecord.isCompleted = true
                 sendResponseFromEmbedded(errFrame, sendTime, reqId, "DISPENSE", "ERROR")
             }
         }
     }
 
     /**
-     * Implements Section 39 Note:
-     * Maximum 3 pumps running simultaneously.
-     * Starts the 3 pumps with highest required duration_ms.
-     * When any completes, the next highest-duration pending pump starts.
-     * Scaled to reasonable simulation time for quick UI feedback (min 1 sec, max 4 sec).
+     * Implements Section 39 Normative Rule:
+     * - Maximum 3 active pumps running concurrently.
+     * - Highest-duration pending pumps are started first.
+     * - Tie-breaker: duration_ms descending, pump_id ascending.
+     * - When any active pump completes, the next highest-duration pending pump starts immediately.
+     * - Discrete event timeline is recorded in schedulerEvents.
      */
-    private suspend fun simulateConcurrentDispense(pumps: List<Pair<Int, Long>>) {
-        val maxDuration = pumps.maxOfOrNull { it.second } ?: 1000L
-        // Scale duration down for testing: max ~2.5 seconds
-        val simDuration = maxDuration.coerceIn(1000L, 2500L)
-        delay(simDuration)
+    suspend fun executeDiscreteMax3Scheduler(
+        pumps: List<Pair<Int, Long>>,
+        onEvent: ((PumpScheduleEvent) -> Unit)? = null
+    ) {
+        val pendingQueue = pumps.sortedWith(
+            compareByDescending<Pair<Int, Long>> { it.second }.thenBy { it.first }
+        ).toMutableList()
+
+        val activeList = mutableListOf<ActivePump>()
+        var virtualTimeMs = 0L
+
+        // Fill initial 3 slots
+        while (activeList.size < 3 && pendingQueue.isNotEmpty()) {
+            val next = pendingQueue.removeAt(0)
+            activeList.add(ActivePump(next.first, next.second, next.second))
+            val event = PumpScheduleEvent("STARTED", next.first, next.second, virtualTimeMs)
+            schedulerEvents.add(event)
+            onEvent?.invoke(event)
+        }
+
+        while (activeList.isNotEmpty()) {
+            val minRemaining = activeList.minOf { it.remainingDurationMs }
+            val delayDuration = if (timeScaleFactor != 1.0) (minRemaining * timeScaleFactor).toLong() else minRemaining
+            delay(delayDuration)
+            virtualTimeMs += minRemaining
+
+            activeList.forEach { it.remainingDurationMs -= minRemaining }
+
+            val completed = activeList.filter { it.remainingDurationMs <= 0L }.sortedBy { it.pumpId }
+            for (p in completed) {
+                val event = PumpScheduleEvent("COMPLETED", p.pumpId, p.initialDurationMs, virtualTimeMs)
+                schedulerEvents.add(event)
+                onEvent?.invoke(event)
+                activeList.remove(p)
+            }
+
+            while (activeList.size < 3 && pendingQueue.isNotEmpty()) {
+                val next = pendingQueue.removeAt(0)
+                activeList.add(ActivePump(next.first, next.second, next.second))
+                val event = PumpScheduleEvent("STARTED", next.first, next.second, virtualTimeMs)
+                schedulerEvents.add(event)
+                onEvent?.invoke(event)
+            }
+        }
     }
 
     private fun buildErrorResponse(

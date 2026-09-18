@@ -6,7 +6,12 @@ import org.json.JSONObject
 /**
  * Protocol command names defined in MIXION Protocol V1.0 Section 30.
  */
-enum class ProtocolCommand(val commandName: String, val displayName: String, val isPotentiallyDangerous: Boolean) {
+enum class ProtocolCommand(
+    val commandName: String,
+    val displayName: String,
+    val isPotentiallyDangerous: Boolean,
+    val isTesterDiagnosticOnly: Boolean = false
+) {
     HELLO("HELLO", "HELLO (Handshake)", false),
     CAPABILITIES("CAPABILITIES", "CAPABILITIES (Discovery)", false),
     STATUS("STATUS", "STATUS (Machine State)", false),
@@ -15,7 +20,7 @@ enum class ProtocolCommand(val commandName: String, val displayName: String, val
     STOP("STOP", "STOP (Halt Operation)", false),
     RESET("RESET", "RESET (Clear Faults)", false),
     HEARTBEAT("HEARTBEAT", "HEARTBEAT (Liveness)", false),
-    CUSTOM("CUSTOM", "CUSTOM (Raw / Error Test)", false);
+    CUSTOM("CUSTOM", "CUSTOM (Tester Diagnostic Mode)", false, isTesterDiagnosticOnly = true);
 
     companion object {
         fun fromName(name: String): ProtocolCommand? {
@@ -23,6 +28,16 @@ enum class ProtocolCommand(val commandName: String, val displayName: String, val
         }
     }
 }
+
+/**
+ * Discovered hardware capabilities retrieved from Embedded Brain via CAPABILITIES command.
+ */
+data class DiscoveredCapabilities(
+    val pumpCount: Int,
+    val supportedPumpIds: Set<Int>,
+    val commands: Set<String>,
+    val timestamp: Long = System.currentTimeMillis()
+)
 
 /**
  * Response statuses defined in MIXION Protocol V1.0 Section 31.
